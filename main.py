@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 
 from pyspark.sql import SparkSession
@@ -7,10 +8,13 @@ from pyspark.sql.functions import from_json, window, col, udf, to_json, struct
 from pyspark.sql.types import *
 
 CHECKPOINT_LOCATION = '/tmp/spark/checkpoints'
+JUNCTIONS = None
+LANES = None
 
 
 def main():
-    shutil.rmtree(CHECKPOINT_LOCATION)
+    if os.path.exists(CHECKPOINT_LOCATION):
+        shutil.rmtree(CHECKPOINT_LOCATION)
 
     with open('sumo_map/junctions.json') as f:
         junctions = json.loads(f.read())
@@ -30,10 +34,10 @@ def main():
         .readStream \
         .format('kafka') \
         .option('kafka.bootstrap.servers', 'localhost:9092') \
-        .option('subscribe', 'nis-waittime') \
+        .option('subscribe', 'traffic') \
         .load()
 
-    schema = StructType([
+    traffic_schema = StructType([
         StructField('car_id', StringType()),
         StructField('road_id', StringType()),
         StructField('lane_id', StringType()),
@@ -44,26 +48,31 @@ def main():
         StructField('timestamp', DoubleType())
     ])
 
-    map_junction_to_lat_lon = udf(lambda junction_id: {
+    lane_to_next_junction = udf(lambda lane_id: junctions[lanes[lane_id]['next_junction']], StructType({
+        StructField('id', StringType()),
+        StructField('type', StringType())
+    }))
+    lane_id_to_max_speed = udf(lambda lane_id: lanes[lane_id]['max_speed'], DoubleType())
+    junction_id_to_coords = udf(lambda junction_id: {
         'lat': junctions[junction_id]['lat'],
         'lon': junctions[junction_id]['lon']
     }, MapType(StringType(), DoubleType()))
 
-    map_lane_id_to_next_junction = udf(lambda lane_id: lanes[lane_id]['next_junction'], StringType())
+    traffic = df \
+        .select(col('value').cast(StringType())) \
+        .select(from_json('value', traffic_schema).alias('row')) \
+        .select('row.*')
 
-    map_lane_id_to_max_speed = udf(lambda lane_id: lanes[lane_id]['max_speed'], DoubleType())
-
-    df \
-        .selectExpr('CAST(value AS STRING)') \
-        .select(from_json('value', schema).alias('row')) \
-        .select('row.*') \
-        .withColumn('speed_pct', col('speed') / map_lane_id_to_max_speed(col('lane_id'))) \
-        .withColumn('next_junction', map_lane_id_to_next_junction(col('lane_id'))) \
+    traffic \
+        .withColumn('next_junction', lane_to_next_junction(col('lane_id'))) \
+        .where(col('next_junction').getField('id') == 'cluster_5287628218_5287628220_5287628726_5287628727_6522223862_cluster_453204528_453204531') \
+        .withColumn('speed_pct', col('speed') / lane_id_to_max_speed(col('lane_id'))) \
         .withColumn('timestamp', col('timestamp').cast(TimestampType())) \
-        .groupBy(window('timestamp', '30 seconds', '5 seconds'), col('next_junction')) \
+        .withWatermark('timestamp', '30 seconds') \
+        .groupBy(window('timestamp', '30 seconds', '5 seconds'), col('next_junction').getField('id').alias('junction_id')) \
         .agg(F.avg('speed_pct')).withColumnRenamed('avg(speed_pct)', 'avg_speed_pct') \
-        .withColumn('next_junction', map_junction_to_lat_lon(col('next_junction'))) \
-        .select(struct('window', 'next_junction', 'avg_speed_pct').alias('value_as_struct')) \
+        .withColumn('coords', junction_id_to_coords(col('junction_id'))) \
+        .select(struct('junction_id', 'coords', 'avg_speed_pct').alias('value_as_struct')) \
         .select(to_json('value_as_struct').alias('value')) \
         .writeStream \
         .format('kafka') \
